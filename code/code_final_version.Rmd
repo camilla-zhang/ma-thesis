@@ -1,0 +1,670 @@
+---
+title: "thesis_v5"
+author: "Camilla Zhang"
+date: "2022-10-24"
+output:
+  pdf_document: default
+  html_document: default
+---
+### Import Libraries
+```{r}
+library(dplyr)
+library(countrycode)
+library(stringr)
+library(plm)
+library(tidyr)
+library(data.table)
+library(ggplot2)
+library(Hmisc)
+library(zoo)
+library(ggplot2)
+library(ggthemes)
+library(purrr)
+library(rworldmap)
+library(psych)
+```
+### Import datasets
+```{r}
+desta = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/desta.csv")
+withdrawals = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/withdrawals.csv")
+withdrawals = withdrawals[!duplicated(withdrawals),]  #remove duplicates for withdrawals
+desta_dyads = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/desta_dyads_v3.csv")
+desta_dyads1 = desta_dyads[!duplicated(desta_dyads),] #Remove duplicate entries in dyadic data
+hdi = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/hdi_composite.csv", row.names=NULL)
+vdem = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/vdem_folder/vdem.csv", row.names=NULL)
+gallup = read.csv("/Users/jayzee/Documents/qmss_fall22/thesis/data/gallup.csv")
+```
+### Test subset data (to ensure wrangling merging was successful)
+```{r}
+#desta_dyads1 = subset(desta_dyads, base_treaty %in% c(1, 192, 65, 810, 562))
+#desta_dyads1 = subset(desta_dyads, base_treaty %in% c(192, 1, 249))
+```
+
+### Divide dataset between base, accession, and consolidated
+```{r}
+#Base 
+base_ptas = subset(desta_dyads1, entry_type == "base_treaty")
+
+#Consolidated
+consolidated_ptas = subset(desta_dyads1, entry_type == "consolidated")
+
+#Accession 
+accession_ptas = subset(desta_dyads1, entry_type == "accession")
+```
+
+
+###Merge DESTA data with dyadic data to aggregate by country-PTA-year
+```{r}
+#Join DESTA indices with BASE PTAs based on base treaty number and year
+merged_base = merge(base_ptas, desta[,c("base_treaty", "year", "depth_index", "depth_rasch")], by = c("base_treaty", "year"), all.x = TRUE)
+
+#Join DESTA indices with BASE PTAs based on *new* treaty number and year for consolidate PTAs that changed their provisions/depth (The consol. PTAs with updated depth index will get an index, others an NA)
+merged_con = merge(consolidated_ptas, desta[,c("number", "depth_index", "depth_rasch")], by = c("number"), all.x = TRUE)
+#Subset consolidated data where depth is not NA
+con_non_nas = merged_con[!is.na(merged_con$depth_index),]
+#Bind non NA consolidated data w/merged data
+con_base = rbind(con_non_nas, merged_base)
+
+#Subset CONSOLIDATED PTAs with NA and populate it (These are NAs b/c their depth/provisions didn't change)
+con_nas <- merged_con[is.na(merged_con$depth_index),] #Subset
+con_nas2 = merge(con_nas, desta[,c("base_treaty", "depth_index")], by = c("base_treaty"), all.x = TRUE) %>% #populate based on base treaty
+dplyr::rename(depth_index = depth_index.y)  
+merged_con2 = subset(con_nas2, select = -c(depth_index.x)) #remove duplicate columns
+
+# Join the CON BASE and (previously NA) CONSOLIDATED datasets together
+con_base2 = rbind(merged_con2, con_base)
+con_base2 <- con_base2[!is.na(con_base2$depth_index),]
+
+# Remove duplicate rows based on country, base treaty, year, and depth index
+con_base3 = con_base2[!duplicated(con_base2[c("iso1", "depth_index", "base_treaty", "year")]),] 
+
+# Rename depth index column to depth_filled
+con_base3 = con_base3 %>% dplyr::rename(depth_filled = depth_index)
+```
+
+### Appending accession countries 
+```{r}
+#Add missing years by base treaty and fill PTA count with 0
+desta2 = desta %>% group_by(base_treaty) %>% tidyr::complete(year = min(year):2021, fill = list(depth = NA))
+
+#Populate the depth based on previous year's depth index
+desta2$depth_filled <- na.locf(desta2$depth_index) 
+
+#Create accession variable for the new DESTA
+merged_acc = merge(accession_ptas, desta2[,c("depth_filled", "depth_rasch", "base_treaty", "year")], by = c("base_treaty", "year"), all.x = TRUE)
+
+#Bind accession with con/base PTAs
+merged_all = rbind(con_base3, merged_acc)
+
+#Rename ISO column
+merged_all = merged_all %>% dplyr::rename(iso3n = iso1)
+```
+
+
+### Merge DESTA data with GWP incumbent support data
+```{r}
+#Merge by iso3 numeric country codes
+gallup$iso3n = countryname(gallup$Geography, destination = 'iso3n')
+
+#Merge by year
+gallup = gallup %>% 
+  dplyr::rename(year = Time)
+
+#Remove NAs where country and approval ratings are NA 
+gallup = subset(gallup, iso3n != "NA") 
+gallup = subset(gallup, Approve != "NA")
+
+#Remove percentages in approval rating variable
+gallup$Approve <- as.integer(gsub('%', '', gallup$Approve))
+
+merged_all = merge(merged_all, gallup, by = c("iso3n", "year"), all.x = TRUE)
+```
+# Find the mean and median of treaties
+```{r}
+#Get average difference between year and entryforceyear
+merged_all$difference_year = merged_all$entryforceyear-merged_all$year
+mean(merged_all$difference_year, na.rm = T)
+median(merged_all$difference_year, na.rm = T)
+#Percentage of trade agreements with a depth index
+sum(unique(desta$base_treaty))/sum(unique(desta_dyads1$base_treaty))
+
+```
+
+###Merge PTA data w/HDI + Add a binary indicator to signify if trade agreement is deep
+```{r}
+## Merge HDI with desta data ##
+
+#Subset HDI dataset
+hdi = hdi %>% dplyr::select(iso3, country, region, hdi_1990, hdi_1991, hdi_1992, hdi_1993, hdi_1994, hdi_1995, hdi_1996, hdi_1997, hdi_1998, hdi_1999, hdi_2000, hdi_2001, hdi_2002, hdi_2003, hdi_2004, hdi_2005, hdi_2006, hdi_2007, hdi_2008, hdi_2009, hdi_2010, hdi_2011, hdi_2012, hdi_2013, hdi_2014, hdi_2015, hdi_2016, hdi_2017, hdi_2018, hdi_2019, hdi_2020, hdi_2021, gnipc_2005, gnipc_2006, gnipc_2007, gnipc_2008, gnipc_2009, gnipc_2010, gnipc_2011, gnipc_2012, gnipc_2013, gnipc_2014, gnipc_2015, gnipc_2016, gnipc_2017, gnipc_2018, gnipc_2019, gnipc_2020, gnipc_2021, mys_2005, mys_2006, mys_2007, mys_2008, mys_2009, mys_2010, mys_2011, mys_2012, mys_2013, mys_2014, mys_2015, mys_2016, mys_2017, mys_2018, mys_2019, mys_2020, mys_2021)
+
+#Produce iso3 numeric country codes for hdi_hdi dataset
+hdi$iso3n = countryname(hdi$country, destination = 'iso3n')
+
+#Merge HDI with PTA data
+hdi_hdi = hdi %>%
+  tidyr::pivot_longer(
+    cols = starts_with("hdi_"),
+    names_to = "year",
+    names_prefix = "hdi_",
+    values_to = "hdi_score"
+  )
+
+hdi_hdi = hdi_hdi %>% select(iso3n, year, hdi_score)
+depth_data = merge(merged_all, hdi_hdi, by = c("iso3n", "year"), all.x = T) %>% mutate(developing = case_when(hdi_score < 0.8 ~ 1,
+                                           hdi_score>= 0.8 ~ 0))
+
+# Assign NAs in developing to a 1 or 0 based on current values
+depth_data$developing2 = nafill(depth_data$developing, type = "nocb")
+depth_data$developing3 = ifelse(depth_data$developing2 == 0, "Developed", "Developing")
+
+#Signify that an agreement is deep w/binary variable
+depth_data$deep = ifelse(depth_data$depth_filled >= mean(depth_data$depth_filled, na.rm = T), 1, 0)
+```
+
+
+#Descriptive Statistics and EDA
+
+### Data Visualization 1: PTAs signed and Average PTA depth over time b/w developed and developing
+```{r}
+#Count number of PTAs for each country_type-year (developing/not developing)
+country_yr_n = depth_data %>% group_by(developing3,year)  %>% summarise(n = n())
+country_yr_n = subset(country_yr_n, !is.na(developing3)) #Remove NA rows
+country_yr_n = subset(country_yr_n, !is.na(n))
+country_yr_n
+
+#Get average depth of PTAs for each country-year
+country_yr_depth = depth_data %>% group_by(developing3,year) %>% summarise(avg_depth = mean(depth_filled)) 
+country_yr_depth = subset(country_yr_depth, !is.na(developing3)) #Remove NA rows
+country_yr_depth = subset(country_yr_depth, !is.na(avg_depth))
+country_yr_depth
+
+country_n = depth_data %>% group_by(country1) %>% summarise(n = n())
+country_depth = depth_data %>% group_by(country1) %>% summarise(avg_depth = mean(depth_filled))
+country_n
+
+#Add in developing country column 
+country_depth_m = merge(country_depth, depth_data[,c('developing3', 'country1')], by = 'country1', all.x = TRUE)
+country_depth_m = subset(country_depth_m[!duplicated(country_depth_m), ], !is.na(avg_depth))
+country_depth_m
+
+country_n_m = merge(country_n, depth_data[,c('developing3', 'country1')], by = 'country1', all.x = TRUE)
+country_n_m = subset(country_n_m[!duplicated(country_n_m), ], !is.na(n))
+country_n_m
+
+
+#Distribution of average depth index by developing-year
+depth_dy = ggplot(country_yr_depth, aes(x = year, y = avg_depth, color = as.factor(developing3), group = as.factor(developing3))) +
+  geom_line()+
+  geom_point()+
+  scale_color_manual(values=c('Black','Dark Grey'))+
+  ylab("Depth")+
+  xlab("Year")+
+  labs(color = "") +
+  scale_fill_discrete(labels=c('Developed', 'Developing')) +
+  theme_tufte()
+
+# Distribution of average count by developing-year
+count_dy = ggplot(country_yr_n, aes(x = year, y = n, color = as.factor(developing3), group = as.factor(developing3))) +
+  geom_line()+
+  geom_point()+
+  scale_color_manual(values=c('Black','Dark Grey'))+
+  ylab("Count")+
+  xlab("Year")+
+  labs(color = "") +
+  scale_fill_discrete(labels=c('Developed', 'Developing')) +
+  theme_tufte()
+
+count_dy
+depth_dy
+```
+
+```{r}
+# Get distribution of depth index
+ depth_distrib = ggplot(desta, aes(x = depth_index)) + 
+  geom_histogram()+
+  labs(title="Distribution of trade agreement depth", x = "Depth Index", y =  "")+
+  theme_tufte()
+
+# Get distribution of depth index (sqrt transformation)
+depth_distrib_sqrted = ggplot(desta, aes(x = sqrt(depth_index))) + 
+  geom_histogram()+
+  labs(title="Distribution of trade agreement depth", x = "Depth Index", y =  "")+
+  theme_tufte()
+
+
+depth_distrib
+depth_distrib_sqrted
+```
+
+#Add 3 control variables
+
+###1. Adding GDP 
+```{r}
+#Merge GDP with pta data
+hdi_gdp = hdi %>%
+  tidyr::pivot_longer(
+    cols = starts_with("gnipc_"),
+    names_to = "year",
+    names_prefix = "gnipc_",
+    values_to = "gdp"
+  )
+
+hdi_gdp = hdi_gdp %>% select(iso3n, year, gdp)
+depth_data = merge(depth_data, hdi_gdp, by = c("iso3n", "year"), all.x = T)
+
+# Get distribution of GDP 
+gdp_distrib = ggplot(depth_data, aes(x = log(gdp))) + 
+  geom_histogram()+
+  labs(title="Distribution of GDP", x = "GDP", y =  "")+
+  theme_tufte()
+gdp_distrib
+```
+
+###2. Adding mean yrs of schooling (EDU)
+```{r}
+#Merge school with PTA data
+hdi_edu = hdi %>%
+  tidyr::pivot_longer(
+    cols = starts_with("mys_"),
+    names_to = "year",
+    names_prefix = "mys_",
+    values_to = "edu"
+  )
+
+hdi_edu = hdi_edu %>% select(iso3n, year, edu)
+depth_data = merge(depth_data, hdi_edu, by = c("iso3n", "year"), all.x = T)
+
+edu_distrib = ggplot(depth_data, aes(x = edu)) + 
+  geom_histogram()+
+  labs(title="Distribution of education", x = "education (in mean years of schooling)", y =  "")+
+  theme_tufte()
+edu_distrib
+```
+
+###3. Adding Regime Type
+```{r}
+#Convert vdem country names to iso3n
+vdem = vdem[,c("country_name", "country_text_id", "country_id", "year", "v2x_regime")]
+vdem$iso3n = countrycode(vdem$country_text_id, origin = 'iso3c', destination = 'iso3n')
+#merge regime with pta data
+depth_data = merge(depth_data, vdem[,c("iso3n", "v2x_regime", "year")], by = c("iso3n", "year"), all.x = TRUE)
+
+regime_distrib = ggplot(depth_data, aes(x = v2x_regime)) + 
+  geom_histogram()+
+  labs(title="Distribution of regime type", x = "Regime score", y =  "")+
+  theme_tufte()
+regime_distrib
+```
+
+
+```{r}
+#Subset data down to 2005-2021 and non-NA values
+depth_data2 = depth_data[depth_data$year > 2004,]
+depth_data2 = depth_data2[!is.na(depth_data2$Approve),]
+length(unique(depth_data2$iso3n))
+length(unique(depth_data2[depth_data2$developing == 1,]$iso3n))
+```
+
+# Models
+
+## PTA Depth Level Analysis (w/year as independent variable)
+
+### Model 1: Depth w/Lags and logged Depth/GDP
+```{r}
+fe_mod1 <- plm(Approve ~ Lag(sqrt(depth_filled), shift = 2) +
+                  developing +
+                  Lag(log(gdp)) +
+                  Lag(edu) +
+                  Lag(v2x_regime) +
+                  year + 
+                  Lag(sqrt(depth_filled), shift = 1)*developing,
+                    data = subset(depth_data2),
+                    index = c("iso3n", "year"), 
+                    model = "within",
+                    effect = "twoways")
+summary(fe_mod1)
+```
+
+
+
+## Country-Count Level Analysis (w/year as independent variable)
+```{r}
+#Count all PTAs for each country-year (to get change)
+desta_dyads1 = desta_dyads1 %>% rename(iso3n = iso1)
+pta_count = desta_dyads1 %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_pta = n())
+
+#Count all PTA withdrawals for each country-year
+withdrawals = withdrawals %>% rename(iso3n = iso1)
+withdrawals_count = withdrawals %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_withdrawals = n())
+
+#Merge withdrawals column to desta_country_yr
+count_data = merge(pta_count, withdrawals_count, by = c("year", "iso3n"), all.x = TRUE, all.y = TRUE)
+
+#Add missing years
+count_data <- setDT(count_data)[CJ(iso3n=iso3n, year=seq(min(year), 2021), unique=TRUE),
+              on=.(iso3n, year)]
+
+#fill PTA count with 0
+count_data <- count_data %>% mutate(count_pta = ifelse(is.na(count_pta), 0, count_pta),
+                                                  count_withdrawals = ifelse(is.na(count_withdrawals), 0, count_withdrawals))
+
+#Add the PTAs
+count_data = count_data %>% group_by(iso3n) %>%
+    mutate(across(count_pta, ~ accumulate(., `+`)))
+count_data = count_data %>% group_by(iso3n) %>%
+    mutate(across(count_withdrawals, ~ accumulate(., `+`)))
+
+#Create total PTA column
+count_data$total_ptas = count_data$count_pta - count_data$count_withdrawals
+
+## Merge approval ratings w/data ##
+count_data = merge(count_data, gallup, by = c("iso3n", "year"), all.x = TRUE)
+
+## Merge HDI w/data ##
+count_data = merge(count_data, hdi_hdi, by = c("iso3n", "year"), all.x = T) %>% mutate(developing = case_when(hdi_score < 0.8 ~ 1,
+                                           hdi_score>= 0.8 ~ 0))
+
+## Merge Control variables w/data ##
+count_data = merge(count_data, hdi_gdp, by = c("iso3n", "year"), all.x = T)
+count_data = merge(count_data, hdi_edu, by = c("iso3n", "year"), all.x = T)
+count_data = merge(count_data, vdem[,c("iso3n", "v2x_regime", "year")], by = c("iso3n", "year"), all.x = TRUE)
+
+# Assign NAs in developing to a 1 or 0 based on current values
+count_data$developing2 = nafill(count_data$developing, type = "nocb")
+count_data$developing3 = ifelse(count_data$developing2 == 0, "Developed", "Developing")
+
+#Remove duplicate country-yr
+count_data$unique_id <- paste(count_data$iso3n,count_data$year) # concatenate to make unique ID
+count_data$duplicate = duplicated(count_data$unique_id) # generate the duplicate variable
+count_data = count_data[count_data$duplicate != "TRUE", ] 
+
+count_data$duplicate = duplicated(count_data$unique_id) # generate the duplicate variable
+
+#Subset data down to 2005-2021 and non-NA values
+count_data2 = count_data[count_data$year > 2004,]
+count_data2 = count_data2[!is.na(count_data2$Approve),]
+```
+
+### Model 1: Change in PTA membership count
+```{r}
+#Build FE model on PTA count
+fe_mod2 <- plm(Approve ~ Lag(total_ptas, shift = 2) + 
+                 Lag(log(gdp)) + 
+                 Lag(edu) + 
+                 Lag(v2x_regime) + 
+                 year + 
+                 Lag(total_ptas, shift = 2)*developing,
+                    data = count_data2,
+                    index = c("iso3n", "year"), 
+                    model = "within",
+                    effect = "twoways")
+summary(fe_mod2)
+```
+
+##Country Count-Level Analysis II: Change in deeper agreements
+
+### Model 2: Change in (deeper) PTA membership count
+```{r}
+#obtain a list of PTAs that have a depth > mean of depth
+deep_ptas = subset(desta, desta$depth_index > mean(desta$depth_index))$base_treaty
+
+
+#Subset desta dyads and withdrawals based on if the base_treaty is greater than mean in desta
+desta_dyads2 = desta_dyads1 %>% filter(number %in% deep_ptas)
+
+#Count all PTAs for each country-year (to get change)
+pta_count = desta_dyads2 %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_pta = n())
+
+#Count all PTA withdrawals for each country-year
+withdrawals2 = withdrawals %>% filter(number %in% deep_ptas)
+withdrawals_count = withdrawals2 %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_withdrawals = n())
+
+#Merge withdrawals column to desta_country_yr
+deep_count_data = merge(pta_count, withdrawals_count, by = c("year", "iso3n"), all.x = TRUE, all.y = TRUE)
+
+#Add missing years
+deep_count_data <- setDT(deep_count_data)[CJ(iso3n=iso3n, year=seq(min(year), 2021), unique=TRUE),
+              on=.(iso3n, year), roll=F]
+
+#fill PTA count with 0
+deep_count_data <- deep_count_data %>% mutate(count_pta = ifelse(is.na(count_pta), 0, count_pta),
+                                                  count_withdrawals = ifelse(is.na(count_withdrawals), 0, count_withdrawals))
+
+#Add the PTAs
+deep_count_data = deep_count_data %>% group_by(iso3n) %>%
+    mutate(across(count_pta, ~ accumulate(., `+`)))
+deep_count_data = deep_count_data %>% group_by(iso3n) %>%
+    mutate(across(count_withdrawals, ~ accumulate(., `+`)))
+
+#Create total PTA column
+deep_count_data$total_ptas = deep_count_data$count_pta - deep_count_data$count_withdrawals
+
+## Merge approval ratings w/data ##
+deep_count_data = merge(deep_count_data, gallup, by = c("iso3n", "year"), all.x = TRUE)
+
+## Merge HDI w/data ##
+deep_count_data = merge(deep_count_data, hdi_hdi, by = c("iso3n", "year"), all.x = T) %>% mutate(developing = case_when(hdi_score < 0.8 ~ 1,
+                                           hdi_score>= 0.8 ~ 0))
+# Assign NAs in developing to a 1 or 0 based on current values
+deep_count_data$developing2 = nafill(deep_count_data$developing, type = "nocb")
+deep_count_data$developing3 = ifelse(deep_count_data$developing2 == 0, "Developed", "Developing")
+
+
+## Merge Control variables w/data ##
+deep_count_data = merge(deep_count_data, hdi_gdp, by = c("iso3n", "year"), all.x = T)
+deep_count_data = merge(deep_count_data, hdi_edu, by = c("iso3n", "year"), all.x = T)
+deep_count_data = merge(deep_count_data, vdem[,c("iso3n", "v2x_regime", "year")], by = c("iso3n", "year"), all.x = TRUE)
+
+#Remove duplicate country-yr
+deep_count_data$unique_id <- paste(deep_count_data$iso3n,deep_count_data$year) # concatenate to make unique ID
+deep_count_data$duplicate = duplicated(deep_count_data$unique_id) # generate the duplicate variable
+deep_count_data = deep_count_data[deep_count_data$duplicate != "TRUE", ]  
+
+#Remove NAs 
+deep_count_data = deep_count_data[!is.na(deep_count_data$Approve),]
+
+#Subset to 2005-2021 and rows without missing data
+deep_count_data2 = deep_count_data[deep_count_data$year > 2004,]
+deep_count_data2 = deep_count_data2[!is.na(deep_count_data2$Approve),]
+```
+
+```{r}
+#Build FE model on PTA count
+fe_mod3 <- plm(Approve ~ 
+                 Lag((total_ptas), shift = 2) + 
+                 Lag(log(gdp)) + 
+                 Lag(edu) + 
+                 Lag(v2x_regime) + 
+                 year + 
+                 Lag((total_ptas), shift = 2)*developing, 
+                    data = deep_count_data2,
+                    index = c("iso3n", "year"), 
+                    model = "within",
+                    effect = "twoways")
+summary(fe_mod3)
+```
+
+
+# Tests for fixed effects
+```{r}
+#Test if we need to control for individual effects
+plmtest(fe_mod1, effect="individual", type="bp")
+plmtest(fe_mod2, effect="individual", type="bp")
+plmtest(fe_mod3, effect="individual", type="bp")
+
+#Test if we need to control for time effects
+plmtest(fe_mod1, effect="time", type="bp")
+plmtest(fe_mod2, effect="time", type="bp")
+plmtest(fe_mod3, effect="time", type="bp")
+```
+
+# Summary Statistics Pt 2
+
+## Average PTA memberships per country over time b/w developed and developing
+```{r}
+#Count number of PTAs for each country type-year (developing/not developing)
+
+country_yr_n = count_data %>% group_by(developing3,year)  %>% summarise(n = mean(total_ptas))
+country_yr_n = subset(country_yr_n, !is.na(developing3)) #Remove NA rows
+country_yr_n = subset(country_yr_n, !is.na(n))
+
+# Average PTAs per year between 1990-2021 by developing country
+count_dy = ggplot(country_yr_n, aes(x = year, y = n, color = as.factor(developing3), group = as.factor(developing3))) +
+  geom_line()+
+  geom_point()+
+  scale_color_manual(values=c('Black','Dark Grey'))+
+  ylab("Average PTAs")+
+  xlab("Year")+
+  labs(color = "") +
+  theme_tufte()
+count_dy
+```
+
+# Descriptive Stats Table
+```{r}
+count_data_ds = subset(count_data, year < 2022 & year > 2004) %>% select(iso3n, Approve, total_ptas, gdp, edu, v2x_regime, developing)
+summary_table = psych::describe(count_data_ds)
+
+
+count_data_developing = subset(count_data_ds, developing == 1)
+count_data_developed = subset(count_data_ds, developing == 0)
+
+summary_table_developing = psych::describe(count_data_developing)
+summary_table_developed = psych::describe(count_data_developed)
+
+summary_table
+summary_table_developing
+summary_table_developed
+
+#Obtain average number of deep trade agreements and by country-type
+deep_count_data_ds = subset(deep_count_data, year < 2022 & year > 2004) %>% select(iso3n, total_ptas, developing) %>% rename(deep_ptas = total_ptas)  
+deep_summary_table = psych::describe(deep_count_data_ds)
+deep_count_data_developing = subset(deep_count_data_ds, developing == 1)
+deep_count_data_developed = subset(deep_count_data_ds, developing == 0)
+deep_summary_table_developing = psych::describe(deep_count_data_developing)
+deep_summary_table_developed = psych::describe(deep_count_data_developed)
+deep_summary_table
+deep_summary_table_developing
+deep_summary_table_developed
+```
+
+
+# Robustness Check 1: RE and Hausman Test
+```{r}
+re_mod1 <- plm(Approve ~ Lag(sqrt(depth_filled), shift = 2) +
+                  developing +
+                  Lag(log(gdp)) +
+                  Lag(edu) +
+                  Lag(v2x_regime) +
+                  year +
+                  Lag(sqrt(depth_filled), shift = 2)*developing,
+                    data = depth_data2,
+                    index = c("iso3n", "year"), 
+                    model = "random")
+summary(re_mod1)
+phtest(fe_mod1, re_mod1)
+
+#Build RE model on PTA count
+re_mod2 <- plm(Approve ~ Lag(total_ptas, shift = 2) + 
+                 Lag(log(gdp)) + 
+                 Lag(edu) + 
+                 Lag(v2x_regime) + 
+                 year + 
+                 Lag(total_ptas, shift = 2)*developing,
+                    index = c("iso3n", "year"),
+                    data = count_data2, 
+                    model = "random")
+summary(re_mod2)
+phtest(fe_mod2, re_mod2)
+
+#Build RE model on deep PTA count
+re_mod3 <- plm(Approve ~ 
+                 Lag((total_ptas), shift = 2) + 
+                 Lag(log(gdp)) + 
+                 Lag(edu) + 
+                 Lag(v2x_regime) + 
+                 year + 
+                 Lag((total_ptas), shift = 2)*developing, 
+                    data = deep_count_data2,
+                    index = c("iso3n", "year"), 
+                    model = "random")
+summary(re_mod3)
+phtest(fe_mod3, re_mod3)
+```
+
+
+# Robustness Check 2: Deep Trade Agreement = index of 4+
+```{r}
+#obtain a list of PTAs that have a depth > mean of depth
+deep_ptas = subset(desta, desta$depth_index > 4)$base_treaty
+
+
+#Subset desta dyads and withdrawals based on if the base_treaty is greater than mean in desta
+desta_dyads2 = desta_dyads1 %>% filter(number %in% deep_ptas)
+
+#Count all PTAs for each country-year (to get change)
+pta_count = desta_dyads2 %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_pta = n())
+
+#Count all PTA withdrawals for each country-year
+withdrawals2 = withdrawals %>% filter(number %in% deep_ptas)
+withdrawals_count = withdrawals2 %>% dplyr::group_by(iso3n, year) %>% dplyr::summarise(count_withdrawals = n())
+
+#Merge withdrawals column to desta_country_yr
+deep_count_data = merge(pta_count, withdrawals_count, by = c("year", "iso3n"), all.x = TRUE, all.y = TRUE)
+
+#Add missing years
+deep_count_data <- setDT(deep_count_data)[CJ(iso3n=iso3n, year=seq(min(year), 2021), unique=TRUE),
+              on=.(iso3n, year), roll=F]
+
+#fill PTA count with 0
+deep_count_data <- deep_count_data %>% mutate(count_pta = ifelse(is.na(count_pta), 0, count_pta),
+                                                  count_withdrawals = ifelse(is.na(count_withdrawals), 0, count_withdrawals))
+
+#Add the PTAs
+deep_count_data = deep_count_data %>% group_by(iso3n) %>%
+    mutate(across(count_pta, ~ accumulate(., `+`)))
+deep_count_data = deep_count_data %>% group_by(iso3n) %>%
+    mutate(across(count_withdrawals, ~ accumulate(., `+`)))
+
+#Create total PTA column
+deep_count_data$total_ptas = deep_count_data$count_pta - deep_count_data$count_withdrawals
+
+## Merge approval ratings w/data ##
+deep_count_data = merge(deep_count_data, gallup, by = c("iso3n", "year"), all.x = TRUE)
+
+## Merge HDI w/data ##
+deep_count_data = merge(deep_count_data, hdi_hdi, by = c("iso3n", "year"), all.x = T) %>% mutate(developing = case_when(hdi_score < 0.8 ~ 1,
+                                           hdi_score>= 0.8 ~ 0))
+# Assign NAs in developing to a 1 or 0 based on current values
+deep_count_data$developing2 = nafill(deep_count_data$developing, type = "nocb")
+deep_count_data$developing3 = ifelse(deep_count_data$developing2 == 0, "Developed", "Developing")
+
+
+## Merge Control variables w/data ##
+deep_count_data = merge(deep_count_data, hdi_gdp, by = c("iso3n", "year"), all.x = T)
+deep_count_data = merge(deep_count_data, hdi_edu, by = c("iso3n", "year"), all.x = T)
+deep_count_data = merge(deep_count_data, vdem[,c("iso3n", "v2x_regime", "year")], by = c("iso3n", "year"), all.x = TRUE)
+
+#Remove duplicate country-yr
+deep_count_data$unique_id <- paste(deep_count_data$iso3n,deep_count_data$year) # concatenate to make unique ID
+deep_count_data$duplicate = duplicated(deep_count_data$unique_id) # generate the duplicate variable
+deep_count_data = deep_count_data[deep_count_data$duplicate != "TRUE", ] 
+
+#Subset to 2005-2021 and rows without missing data
+deep_count_data3 = deep_count_data[deep_count_data$year > 2004,]
+deep_count_data3 = deep_count_data3[!is.na(deep_count_data3$Approve),]
+
+#Build FE model on PTA count
+fe_mod4 <- plm(Approve ~ 
+                 Lag((total_ptas), shift = 2) + 
+                 Lag(log(gdp)) + 
+                 Lag(edu) + 
+                 Lag(v2x_regime) + 
+                 year, 
+                    data = deep_count_data3,
+                    index = c("iso3n", "year"), 
+                    model = "within",
+                    effect = "twoways")
+summary(fe_mod4)
+```
+```
